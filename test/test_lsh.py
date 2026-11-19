@@ -7,6 +7,7 @@ import numpy as np
 
 from datasketch.lsh import MinHashLSH
 from datasketch.minhash import MinHash
+from datasketch.storage import UnsupportedStorageError
 from datasketch.weighted_minhash import WeightedMinHashGenerator
 
 
@@ -438,6 +439,61 @@ class TestMinHashLSH(unittest.TestCase):
                     items = table[H]
                     self.assertTrue("a".encode("utf8") not in items)
                     self.assertTrue("b".encode("utf8") not in items)
+
+
+class TestPagedBucketScan(unittest.TestCase):
+    def _lsh(self, num_perm=16, params=(4, 4), prepickle=False):
+        return MinHashLSH(num_perm=num_perm, params=params, prepickle=prepickle)
+
+    def test_bucket_lookup_does_not_copy_and_counts_empty(self):
+        lsh = self._lsh()
+        m1 = MinHash(16)
+        m1.update(b"a")
+        lsh.insert("a", m1)
+        band = 0
+        H, size = lsh._paged_bucket_lookup(m1.hashvalues, band)
+        self.assertEqual(size, 1)
+        self.assertEqual(H, lsh._H(m1.hashvalues[:4]))
+        # An absent bucket is reported as size 0.
+        other = MinHash(16)
+        other.update(b"zzz")
+        _, other_size = lsh._paged_bucket_lookup(other.hashvalues, band)
+        self.assertEqual(other_size, 0)
+
+    def test_bucket_cursor_resumes(self):
+        lsh = self._lsh(params=(2, 8))
+        base = MinHash(16)
+        base.update(b"base")
+        for i in range(20):
+            hv = np.array(base.hashvalues, copy=True)
+            hv[8:] = np.uint64(1_000_000 + i)
+            m = MinHash(16, hashvalues=hv)
+            lsh.insert(str(i), m)
+        # All keys collide in band 0.
+        table = lsh.hashtables[0]
+        bucket_key = lsh._H(base.hashvalues[:8])
+        cursor = lsh._paged_bucket_cursor(0, bucket_key)
+        first = [next(cursor) for _ in range(5)]
+        rest = list(cursor)
+        self.assertEqual(len(first), 5)
+        self.assertEqual(len(rest), 15)
+        self.assertEqual(set(first + rest), set(table[bucket_key]))
+        self.assertTrue(all(key in table[bucket_key] for key in first))
+
+    def test_unsupported_storage_raises(self):
+        with patch("redis.Redis", fake_redis):
+            lsh = MinHashLSH(
+                num_perm=16,
+                params=(4, 4),
+                storage_config={"type": "redis", "redis": {"host": "localhost", "port": 6379}},
+            )
+            m = MinHash(16)
+            m.update(b"a")
+            lsh.insert("a", m)
+            with self.assertRaises(UnsupportedStorageError):
+                lsh._paged_bucket_lookup(m.hashvalues, 0)
+            # The regular query path is unchanged for non-dict backends.
+            self.assertEqual(lsh.query(m), ["a"])
 
 
 class TestWeightedMinHashLSH(unittest.TestCase):

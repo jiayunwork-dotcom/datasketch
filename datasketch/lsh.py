@@ -11,8 +11,10 @@ from datasketch.minhash import MinHash
 from datasketch.storage import (
     OrderedStorage,
     UnorderedStorage,
+    UnsupportedStorageError,
     _random_name,
     ordered_storage,
+    supports_paged_bucket_scan,
     unordered_storage,
 )
 from datasketch.weighted_minhash import WeightedMinHash
@@ -548,6 +550,66 @@ class MinHashLSH:
         if self.prepickle:
             return {pickle.loads(key) for key in candidates}
         return candidates
+
+    def _paged_bucket_lookup(self, hashvalues, band: int):
+        """Look up the bucket of one band without reading any of its keys.
+
+        This is the metered "bucket lookup" step of a paged query: it computes
+        the band's bucket key and asks the bucket storage how many keys it
+        holds, but never copies the bucket. An absent bucket and an empty
+        bucket are equivalent and both count as a lookup.
+
+        Args:
+            hashvalues (numpy.ndarray): The hash values of the query MinHash.
+            band (int): Index of the band (hash table) to look up.
+
+        Returns:
+            tuple: ``(bucket_key, bucket_size)``. ``bucket_size`` is 0 when the
+            bucket is absent or empty.
+
+        Raises:
+            ValueError: If `band` is out of range.
+            datasketch.storage.UnsupportedStorageError: If the bucket storage
+                cannot iterate a bucket lazily.
+
+        """
+        if band < 0 or band >= len(self.hashtables):
+            raise ValueError("band must be in [0, %d)" % len(self.hashtables))
+        hashtable = self.hashtables[band]
+        if not supports_paged_bucket_scan(hashtable):
+            raise UnsupportedStorageError(
+                "Paged bucket scans require dict-backed bucket storage, got %s" % type(hashtable).__name__
+            )
+        start, end = self.hashranges[band]
+        H = self._H(hashvalues[start:end])
+        return H, hashtable.bucket_size(H)
+
+    def _paged_bucket_cursor(self, band: int, bucket_key):
+        """Return a lazy, resumable cursor over a band's bucket.
+
+        Only one key is produced per ``next()`` call and the cursor keeps its
+        position, so a caller can stop after a budget is spent and continue
+        from the same position on a later page without the bucket being copied.
+
+        Args:
+            band (int): Index of the band (hash table).
+            bucket_key: The bucket key returned by
+                :meth:`MinHashLSH._paged_bucket_lookup`.
+
+        Returns:
+            Iterator: A cursor over the bucket's keys.
+
+        Raises:
+            datasketch.storage.UnsupportedStorageError: If the bucket storage
+                cannot be scanned lazily.
+
+        """
+        hashtable = self.hashtables[band]
+        if not supports_paged_bucket_scan(hashtable):
+            raise UnsupportedStorageError(
+                "Paged bucket scans require dict-backed bucket storage, got %s" % type(hashtable).__name__
+            )
+        return hashtable.bucket_cursor(bucket_key)
 
     def get_counts(self) -> list[dict[Hashable, int]]:
         """Returns a list of length :attr:`b` (i.e., number of hash tables) with

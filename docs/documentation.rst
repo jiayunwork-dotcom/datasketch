@@ -63,6 +63,12 @@ MinHash LSH Ensemble
     :members:
     :special-members:
 
+.. autoclass:: datasketch.MinHashLSHEnsembleQuery
+    :members:
+
+.. autoclass:: datasketch.MinHashLSHEnsemblePage
+    :members:
+
 HyperLogLog
 -----------
 

@@ -94,10 +94,53 @@ Just like MinHash LSH, LSH Ensemble also works directly with :ref:`minhash` data
         print("m2" in lshensemble)
         print("m3" in lshensemble)
 
-        # Using m1 as the query, get an result iterator 
+        # Using m1 as the query, get an result iterator
         print("Sets with containment > 0.8:")
         for key in lshensemble.query(m1, len(set1)):
             print(key)
+
+Paged queries
+-------------
+
+A hot bucket can hold thousands of keys, so iterating :meth:`query` to the
+end can take a long time before a caller sees candidates from the other
+partitions. For near-duplicate screening, where each candidate should be
+checked as soon as it arrives, :meth:`MinHashLSHEnsemble.query_paged` returns
+a cursor whose pages are measured in budget units instead::
+
+        cursor = lshensemble.query_paged(m1, len(set1))
+        while not cursor.done:
+            page = cursor.next_page(64)   # caller-chosen positive budget
+            for key in page.keys:
+                recheck(key)              # inspect this material now
+            print(page.budget_used, page.done)
+
+A page charges one unit for every bucket lookup (an empty bucket still
+costs one) and one for every key actually read from a bucket, including a
+key that another band already delivered. The page stops as soon as the
+budget is spent and keeps all read positions, so the next call resumes
+instead of restarting. Each query delivers a given key at most once; read
+to the end, the concatenated pages contain exactly the keys of
+:meth:`query` on the same index. Pass an invalid budget (zero, negative,
+non-integer) and the cursor raises without moving, so the corrected budget
+continues from the same position.
+
+Bucket lookups are scheduled before the bulk of bucket reads: band 0 of
+every touched partition is probed first and a bucket found there yields a
+key immediately, then the remaining bands are looked up in
+partition-round-robin order, and only then are the buckets drained
+round-robin. This keeps a small bucket in a later partition reachable
+within a couple of pages even when another bucket has a thousand keys. The
+cost is that a page can be empty (every key found was already delivered)
+while the query is not yet done.
+
+Paged queries need bucket storage that can be read lazily and resumed from
+a position. The default in-memory ``dict`` storage supports this; other
+backends are rejected with :class:`datasketch.storage.UnsupportedStorageError`
+before any bucket is touched. The cursor lives in one process, so pages
+cannot be resumed across processes. Use :meth:`MinHashLSHEnsembleQuery.close`
+or a ``with`` block to stop early; after that no page can be read. Several
+cursors over the same index can be advanced interleaved.
 
 The precision of LSH Ensemble increases with the number of partitions, 
 so does the querying time, as the plot below shows.

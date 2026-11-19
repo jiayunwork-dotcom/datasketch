@@ -26,6 +26,21 @@ except ImportError:
     c_concurrent = None
 
 
+class UnsupportedStorageError(NotImplementedError, ValueError):
+    """Raised when a storage operation is not supported by a backend.
+
+    It is both a :class:`NotImplementedError` and a :class:`ValueError` so
+    callers that check for either convention can handle the same failure.
+    """
+
+
+def supports_paged_bucket_scan(storage) -> bool:
+    """Return True if `storage` can iterate a bucket lazily with a resumable cursor."""
+    if not getattr(storage, "paged_scan_supported", False):
+        return False
+    return all(callable(getattr(storage, name, None)) for name in ("bucket_size", "bucket_cursor"))
+
+
 def ordered_storage(config, name=None) -> "OrderedStorage":
     """Return ordered storage system based on the specified config.
 
@@ -105,6 +120,10 @@ def unordered_storage(config, name=None) -> "UnorderedStorage":
 
 class Storage(ABC):
     """Base class for key, value containers where the values are sequences."""
+
+    #: Whether :meth:`bucket_cursor` can iterate a bucket lazily without
+    #: copying the whole bucket first. Paged LSH queries require this.
+    paged_scan_supported = False
 
     def __getitem__(self, key):
         return self.get(key)
@@ -197,6 +216,31 @@ class Storage(ABC):
         del self._select_buffer[:]
         return buffer
 
+    def bucket_size(self, key) -> int:
+        """Return the number of values stored under `key` without copying them.
+
+        Paged scans use this to know when a bucket is exhausted. Backends that
+        cannot answer this cheaply must not silently materialize the bucket.
+        """
+        raise UnsupportedStorageError(f"{type(self).__name__} does not support paged bucket scans")
+
+    def bucket_cursor(self, key):
+        """Return a lazy cursor over the values stored under `key`.
+
+        The cursor is an iterator that yields one value per ``next()`` call and
+        keeps its position, so a caller can read part of a bucket, return to
+        the caller, and continue later from the same position. Backends whose
+        values cannot be iterated lazily raise :class:`UnsupportedStorageError`.
+
+        Args:
+            key: The bucket key.
+
+        Returns:
+            Iterator: A cursor over this bucket's values.
+
+        """
+        raise UnsupportedStorageError(f"{type(self).__name__} does not support paged bucket scans")
+
 
 class OrderedStorage(Storage):
     pass
@@ -211,6 +255,8 @@ class DictListStorage(OrderedStorage):
     it to support an API consistent with `Storage`.
     """
 
+    paged_scan_supported = True
+
     def __init__(self, config):
         self._dict = defaultdict(list)
 
@@ -219,6 +265,12 @@ class DictListStorage(OrderedStorage):
 
     def get(self, key):
         return self._dict.get(key, [])
+
+    def bucket_size(self, key):
+        return len(self.get(key))
+
+    def bucket_cursor(self, key):
+        return iter(self.get(key))
 
     def remove(self, *keys, **kwargs):
         for key in keys:
