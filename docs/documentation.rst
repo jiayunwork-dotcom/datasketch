@@ -63,6 +63,9 @@ MinHash LSH Ensemble
     :members:
     :special-members:
 
+.. autoclass:: datasketch.MergeNotSupportedError
+    :members:
+
 .. autoclass:: datasketch.MinHashLSHEnsembleQuery
     :members:
 

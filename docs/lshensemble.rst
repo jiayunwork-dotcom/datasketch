@@ -142,6 +142,81 @@ cannot be resumed across processes. Use :meth:`MinHashLSHEnsembleQuery.close`
 or a ``with`` block to stop early; after that no page can be read. Several
 cursors over the same index can be advanced interleaved.
 
+Merging shards
+--------------
+
+An LSH Ensemble partition layout is derived from the size distribution of the
+indexed sets, so indexes built from different shards do not line up: the same
+partition number can cover completely different size ranges. To combine them,
+build each shard with ``mergeable=True`` and call :meth:`merge`:
+
+.. code:: python
+
+    left = MinHashLSHEnsemble(threshold=0.8, num_perm=128, num_part=32, mergeable=True)
+    right = MinHashLSHEnsemble(threshold=0.8, num_perm=128, num_part=32, mergeable=True)
+    left.index(entries_left)
+    right.index(entries_right)
+
+    combined = left.merge(right)              # a new, independent, mergeable index
+    combined = combined.merge(third_shard)    # results can be merged again
+
+``merge`` returns a *new* index. It recomputes the partition bounds from the
+combined, de-duplicated size histogram and re-inserts every key into the
+partition its size falls into, using the same flow as :meth:`index`.
+Consequently the result's partition bounds, its per-query band selection, and
+its candidate keys match an index built in a single shot from the same unique
+entries; only key order is unspecified. The sources are not modified: the
+result uses fresh bucket storage and a fresh key map, so it can be changed or
+deleted without affecting the sources, and cursors already open over either
+source keep reading.
+
+Both indexes must have been built with ``mergeable=True``. An index built
+without it keeps the historical, smaller memory profile and cannot be merged:
+calling ``merge`` on it raises :class:`MergeNotSupportedError` before anything
+is read or written. Only the default in-process ``dict`` storage is supported;
+other backends raise :class:`datasketch.storage.UnsupportedStorageError` before
+any content is touched.
+
+The two indexes must share their construction configuration -- ``threshold``,
+``num_perm``, ``num_part``, ``m``, the optimization ``weights``, and the key
+encoding (``prepickle``) -- and their sketches must have been produced with the
+same ``seed`` and permutation parameters, so their hash values live in the same
+coordinate system. These checks are made even for empty shards. A shard that
+mixed coordinate systems is rejected at :meth:`index` time. Only plain
+:class:`MinHash` sketches are supported; ``WeightedMinHash`` and ``LeanMinHash``
+are rejected.
+
+Overlapping keys are controlled by ``overlap``:
+
+.. code:: python
+
+    combined = left.merge(right, overlap="error")       # fail on any shared key
+    combined = left.merge(right, overlap="identical")   # default
+
+``"error"`` raises as soon as any key is present in both indexes.
+``"identical"`` accepts such a key once, only if its size and complete
+``hashvalues`` are identical in both indexes; any difference raises
+:class:`ValueError`. A shared key is never stored twice, and an accepted
+overlap contributes to the size histogram only once. Key equality follows the
+library's existing convention, so ``bytes``, ``str`` and ``tuple`` keys all
+work under both the default encoding and ``prepickle=True``.
+
+Memory and cost
+~~~~~~~~~~~~~~~
+
+Building a ``mergeable`` index retains each key's size and an immutable 8-byte
+per-dimension snapshot of its hash values, i.e. ``8 * num_perm`` bytes per key
+(the caller's mutable arrays are never kept). The merge itself re-hashes every
+key once per band of its selected ``r``-level index -- ``O(num_keys *
+num_perm / r)`` band hashes in total -- because the key's hash values, not its
+old buckets, are the durable input: old buckets live in the old layout and
+cannot be reused once the partition boundaries move. It does not build a
+key-count by ``num_perm`` vector matrix: it streams the size histogram, then
+inserts each key from its own snapshot. Peak additional memory is therefore
+proportional to the number of keys times one snapshot plus the output index's
+own buckets.
+
+
 The precision of LSH Ensemble increases with the number of partitions, 
 so does the querying time, as the plot below shows.
 The experiment code can be found in the `benchmark` directory

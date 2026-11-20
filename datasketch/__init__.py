@@ -14,7 +14,12 @@ from datasketch.hyperloglog import HyperLogLog, HyperLogLogPlusPlus
 from datasketch.lean_minhash import LeanMinHash
 from datasketch.lsh import MinHashLSH
 from datasketch.lsh_bloom import MinHashLSHBloom
-from datasketch.lshensemble import MinHashLSHEnsemble, MinHashLSHEnsemblePage, MinHashLSHEnsembleQuery
+from datasketch.lshensemble import (
+    MergeNotSupportedError,
+    MinHashLSHEnsemble,
+    MinHashLSHEnsemblePage,
+    MinHashLSHEnsembleQuery,
+)
 from datasketch.lshforest import MinHashLSHForest
 from datasketch.minhash import MinHash
 from datasketch.weighted_minhash import WeightedMinHash, WeightedMinHashGenerator
@@ -29,6 +34,7 @@ __all__ = [
     "HyperLogLog",
     "HyperLogLogPlusPlus",
     "LeanMinHash",
+    "MergeNotSupportedError",
     "MinHash",
     "MinHashLSH",
     "MinHashLSHBloom",

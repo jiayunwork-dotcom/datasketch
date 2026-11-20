@@ -11,9 +11,57 @@ import numpy as np
 from datasketch.lsh import MinHashLSH, integrate
 from datasketch.lshensemble_partition import optimal_partitions
 from datasketch.minhash import MinHash
-from datasketch.storage import UnsupportedStorageError, _random_name, supports_paged_bucket_scan
+from datasketch.storage import (
+    UnsupportedStorageError,
+    _random_name,
+    supports_paged_bucket_scan,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class MergeNotSupportedError(NotImplementedError, ValueError):
+    """Raised when an index cannot be merged in the requested way.
+
+    This is both a :class:`NotImplementedError` and a :class:`ValueError` so
+    callers that check for either convention can handle it. It is raised
+    before the index (or the other index) is modified.
+    """
+
+
+class _RetainedEntry(NamedTuple):
+    """Immutable copy of one indexed set, kept only by mergeable indexes.
+
+    ``hashvalues`` is an immutable ``bytes`` snapshot in native uint64 byte
+    order. It is never a view on a caller-owned array, so later changes to the
+    caller's MinHash cannot alter the merge result.
+    """
+
+    key: Hashable
+    hashvalues: bytes
+    size: int
+
+
+class _RetainedSketch:
+    """A read-only MinHash-shaped view over retained hash value bytes.
+
+    The LSH only needs ``len(sketch)`` and ``sketch.hashvalues[start:end]``.
+    This view exposes those without copying a full key-count by num_perm
+    matrix: ``np.frombuffer`` returns a read-only view of the retained bytes.
+    """
+
+    __slots__ = ("_hashvalues", "seed")
+
+    def __init__(self, hashvalues: bytes, seed: int) -> None:
+        self._hashvalues = hashvalues
+        self.seed = seed
+
+    @property
+    def hashvalues(self) -> np.ndarray:
+        return np.frombuffer(self._hashvalues, dtype=np.uint64)
+
+    def __len__(self) -> int:
+        return len(self._hashvalues) // 8
 
 
 class _InvalidIntegerError(ValueError, TypeError):
@@ -455,6 +503,12 @@ class MinHashLSHEnsemble:
         prepickle (Optional[bool]): If True, all keys are pickled to bytes before
             insertion. If None, a default value is chosen based on the
             `storage_config`.
+        mergeable (bool): If True, the index keeps an immutable copy of every
+            indexed set's hash values and size, so it can later be combined
+            with another mergeable index using :meth:`merge`. This costs
+            ``8 * num_perm`` bytes per indexed key. Indexes built without this
+            option behave and are queried exactly as before and cannot be
+            merged. (`default=False`)
 
     Note:
         Using more partitions (`num_part`) leads to better accuracy, at the
@@ -482,6 +536,7 @@ class MinHashLSHEnsemble:
         weights: tuple[float, float] = (0.5, 0.5),
         storage_config: Optional[dict] = None,
         prepickle: Optional[bool] = None,
+        mergeable: bool = False,
     ) -> None:
         if threshold > 1.0 or threshold < 0.0:
             raise ValueError("threshold must be in [0.0, 1.0]")
@@ -495,12 +550,24 @@ class MinHashLSHEnsemble:
             raise ValueError("Weight must be in [0.0, 1.0]")
         if sum(weights) != 1.0:
             raise ValueError("Weights must sum to 1.0")
+        if not isinstance(mergeable, bool):
+            raise TypeError("mergeable must be a bool")
         self.threshold = threshold
         self.h = num_perm
         self.m = m
+        self._num_part = num_part
+        self._weights = tuple(weights)
+        self._mergeable = mergeable
+        # Retained per-key state, only populated for mergeable indexes.
+        # Each value is a ``_RetainedEntry`` whose hash values are immutable
+        # bytes; the caller's MinHash arrays are never kept.
+        self._entries = {} if mergeable else None
+        self._seed = None
+        self._permutations = None
         rs = self._init_optimal_params(weights)
         # Initialize multiple LSH indexes for each partition
         storage_config = storage_config if storage_config else {"type": "dict"}
+        self._storage_type = storage_config["type"]
         basename = storage_config.get("basename", _random_name(11))
         self.indexes = [
             dict(
@@ -517,6 +584,7 @@ class MinHashLSHEnsemble:
             )
             for partition in range(0, num_part)
         ]
+        self._prepickle = next(iter(self.indexes[0].values())).prepickle
         self.lowers = [None for _ in self.indexes]
         self.uppers = [None for _ in self.indexes]
 
@@ -554,6 +622,110 @@ class MinHashLSHEnsemble:
         config["basename"] = b"-".join([basename, struct.pack(">H", partition), struct.pack(">H", r)])
         return config
 
+    def _entry_id(self, key: Hashable):
+        """Return the form a key takes inside this index's storage.
+
+        The default dict storage keeps keys as given unless ``prepickle`` is
+        on, in which case they are pickled. Using that same form for the
+        retained map keeps key equality identical to the one the LSH applies.
+        """
+        if self._prepickle:
+            return pickle.dumps(key)
+        return key
+
+    @staticmethod
+    def _sketch_coordinates(minhash):
+        """Extract ``(hashvalues_bytes, seed, permutations)`` from a sketch.
+
+        The hash values are copied into immutable ``bytes``; the returned
+        value never aliases the caller's array.
+
+        Raises:
+            TypeError: If the sketch is not a plain :class:`MinHash` with
+                permutation parameters (for example ``WeightedMinHash``,
+                ``bBitMinHash`` or a ``LeanMinHash``).
+            ValueError: If the sketch length is inconsistent.
+
+        """
+        if not isinstance(minhash, MinHash):
+            raise TypeError(
+                "MinHashLSHEnsemble only supports plain MinHash sketches, got %s" % type(minhash).__name__
+            )
+        permutations = getattr(minhash, "permutations", None)
+        if permutations is None:
+            raise TypeError(
+                "MinHashLSHEnsemble requires a MinHash with permutation parameters, "
+                "got %s without them" % type(minhash).__name__
+            )
+        # Cast to the same dtype the LSH band hashing assumes, so the retained
+        # bytes are a faithful, immutable copy of the sketch's coordinates.
+        hashvalues = np.asarray(minhash.hashvalues, dtype=np.uint64)
+        snapshot = (
+            np.asarray(permutations[0], dtype=np.uint64).tobytes(),
+            np.asarray(permutations[1], dtype=np.uint64).tobytes(),
+        )
+        return hashvalues.tobytes(), minhash.seed, snapshot
+
+    def _assign_partitions(self, entries):
+        """Compute partition bounds from ``[(key, hashvalues_bytes, size)]``.
+
+        The distribution is computed from the de-duplicated data that will
+        actually be indexed, so a merged index has exactly the partitions a
+        single-shot build of the same unique entries would have.
+        """
+        if len(entries) == 0:
+            self.lowers = [None for _ in self.indexes]
+            self.uppers = [None for _ in self.indexes]
+            return
+        sizes, counts = np.array(sorted(Counter(e[2] for e in entries).most_common())).T
+        partitions = optimal_partitions(sizes, counts, len(self.indexes))
+        for i, (lower, upper) in enumerate(partitions):
+            self.lowers[i], self.uppers[i] = lower, upper
+
+    def _index_prepared(self, entries):
+        """Insert already-validated entries into the current partition bounds.
+
+        Each key is inserted into exactly one partition -- the one whose
+        bounds contain its size -- and, inside it, into every ``r``-level
+        index. Nothing from any previous partitioning is touched, so no
+        leftover bucket from an older layout can survive.
+
+        Args:
+            entries: Iterable of ``(key, hashvalues_bytes, size)``.
+
+        """
+        ordered = sorted(entries, key=lambda e: e[2])
+        curr_part = 0
+        last_part = len(self.indexes) - 1
+        for key, hashvalues, size in ordered:
+            while curr_part < last_part and size > self.uppers[curr_part]:
+                curr_part += 1
+            sketch = _RetainedSketch(hashvalues, self._seed)
+            for r in self.indexes[curr_part]:
+                self.indexes[curr_part][r].insert(key, sketch)
+
+    def _build(self, prepared, seed, permutations):
+        """Build this index from validated, de-duplicated entries.
+
+        This is the same flow :meth:`index` uses: partition from the size
+        histogram, then insert into exactly one partition per key. It keeps
+        an immutable snapshot of each key's hash values and size so the index
+        can be merged again later.
+
+        Args:
+            prepared (list): ``[(key, hashvalues_bytes, size)]``.
+            seed (int): The permutation seed the bytes were generated with.
+            permutations (tuple): Snapshot of the permutation parameters.
+
+        """
+        self._seed = seed
+        self._permutations = permutations
+        self._assign_partitions(prepared)
+        self._index_prepared(prepared)
+        self._entries = {
+            self._entry_id(key): _RetainedEntry(key, hashvalues, size) for key, hashvalues, size in prepared
+        }
+
     def index(self, entries: Iterable[tuple[Hashable, MinHash, int]]) -> None:
         """Index all sets given their keys, MinHashes, and sizes.
         It can be called only once after the index is created.
@@ -566,34 +738,219 @@ class MinHashLSHEnsemble:
                 and ``size`` is the size or number of unique items in the set.
 
         Raises:
-            ValueError: If the index is not empty or ``entries`` is empty.
+            ValueError: If the index is not empty, ``entries`` is empty, a
+                size is not positive, a key repeats, or (for a ``mergeable``
+                index) a sketch's seed or permutation parameters differ from
+                the first entry's.
+            TypeError: If a ``mergeable`` index is given a sketch that is not
+                a plain :class:`MinHash` with permutation parameters.
 
         """
         if not self.is_empty():
             raise ValueError("Cannot call index again on a non-empty index")
-        if not isinstance(entries, list):
-            queue = deque()
+
+        if not self._mergeable:
+            # Legacy path: unchanged behaviour and memory use.
+            if not isinstance(entries, list):
+                queue = deque()
+                for key, minhash, size in entries:
+                    if size <= 0:
+                        raise ValueError("Set size must be positive")
+                    queue.append((key, minhash, size))
+                entries = list(queue)
+            if len(entries) == 0:
+                raise ValueError("entries is empty")
+            sizes, counts = np.array(sorted(Counter(e[2] for e in entries).most_common())).T
+            partitions = optimal_partitions(sizes, counts, len(self.indexes))
+            for i, (lower, upper) in enumerate(partitions):
+                self.lowers[i], self.uppers[i] = lower, upper
+            entries.sort(key=lambda e: e[2])
+            curr_part = 0
             for key, minhash, size in entries:
-                if size <= 0:
-                    raise ValueError("Set size must be positive")
-                queue.append((key, minhash, size))
-            entries = list(queue)
-        if len(entries) == 0:
-            raise ValueError("entries is empty")
-        # Create optimal partitions.
-        sizes, counts = np.array(sorted(Counter(e[2] for e in entries).most_common())).T
-        partitions = optimal_partitions(sizes, counts, len(self.indexes))
-        for i, (lower, upper) in enumerate(partitions):
-            self.lowers[i], self.uppers[i] = lower, upper
-        # Insert into partitions.
-        entries.sort(key=lambda e: e[2])
-        curr_part = 0
+                u = self.uppers[curr_part]
+                if size > u:
+                    curr_part += 1
+                for r in self.indexes[curr_part]:
+                    self.indexes[curr_part][r].insert(key, minhash)
+            return
+
+        # Mergeable path: validate every sketch and snapshot the immutable
+        # hash-value bytes before assigning partitions, so a bad sketch or a
+        # coordinate mismatch leaves the index empty and untouched. Only the
+        # per-key ``num_perm * 8`` byte snapshot is kept -- never a second
+        # array of the caller's mutable hash values. If the build fails
+        # halfway (allocation error, bad entry) nothing has been inserted into
+        # this index yet.
+        seen = set()
+        prepared = []
+        seed = None
+        permutations = None
         for key, minhash, size in entries:
-            u = self.uppers[curr_part]
-            if size > u:
-                curr_part += 1
-            for r in self.indexes[curr_part]:
-                self.indexes[curr_part][r].insert(key, minhash)
+            if size <= 0:
+                raise ValueError("Set size must be positive")
+            entry_id = self._entry_id(key)
+            if entry_id in seen:
+                raise ValueError("The given key already exists: %r" % (key,))
+            seen.add(entry_id)
+            hashvalues, sketch_seed, sketch_permutations = self._sketch_coordinates(minhash)
+            if len(hashvalues) // 8 != self.h:
+                raise ValueError("Expecting minhash with length %d, got %d" % (self.h, len(hashvalues) // 8))
+            if seed is None:
+                seed, permutations = sketch_seed, sketch_permutations
+            elif sketch_seed != seed:
+                raise ValueError(
+                    "Expecting minhash with seed %d, got %d: different permutations generate different coordinates"
+                    % (seed, sketch_seed)
+                )
+            elif sketch_permutations != permutations:
+                raise ValueError(
+                    "Expecting minhash with the same permutation parameters as the index, got different parameters"
+                )
+            prepared.append((key, hashvalues, size))
+        if not prepared:
+            raise ValueError("entries is empty")
+        self._build(prepared, seed, permutations)
+
+    def merge(self, other: "MinHashLSHEnsemble", *, overlap: str = "identical") -> "MinHashLSHEnsemble":
+        """Combine this index with `other` into a new, independent index.
+
+        The two indexes were built from disjoint (or partly overlapping)
+        shards of a collection. Their partitions were computed from each
+        shard's own size distribution, so their bucket layouts are not
+        compatible. The merge therefore rebuilds the partition bounds from
+        the *combined, de-duplicated* size histogram and re-inserts every
+        key into the partition its size falls into, using the same build flow
+        as :meth:`index`. Queries against the result select the same bands
+        and return the same candidate keys as a single-shot index built from
+        the same unique entries (key order is unspecified).
+
+        Neither source is modified: the result uses fresh bucket storage and
+        a fresh key map, and existing paged cursors over either source can
+        keep reading. This index and `other` must both have been created with
+        ``mergeable=True``; otherwise :class:`MergeNotSupportedError` is
+        raised before anything is read or written. The result is itself
+        mergeable.
+
+        Only the default in-process ``dict`` storage is supported. Other
+        backends raise :class:`datasketch.storage.UnsupportedStorageError`
+        before any index content is touched.
+
+        Both indexes must share the same construction configuration:
+        ``threshold``, ``num_perm``, ``num_part``, ``m``, the optimization
+        ``weights``, and the key encoding (``prepickle``). In addition, the
+        sketches must have been produced with the same ``seed`` and the same
+        permutation parameters, so their hash values live in the same
+        coordinate system. A shard that mixed coordinate systems is already
+        rejected when it is indexed. These checks are made even for empty
+        shards.
+
+        Args:
+            other (MinHashLSHEnsemble): The other mergeable index.
+            overlap (str): How to treat keys present in both indexes.
+                ``"identical"`` (default) accepts an overlapping key once,
+                only if its size, hash coordinate system, and full
+                ``hashvalues`` are identical; any difference raises
+                :class:`ValueError`. ``"error"`` raises :class:`ValueError`
+                as soon as any key overlaps. A key is never kept as two
+                records, and an accepted overlap contributes to the size
+                histogram only once.
+
+        Returns:
+            MinHashLSHEnsemble: A new, independently stored mergeable index.
+
+        Raises:
+            MergeNotSupportedError: If either index was not built with
+                ``mergeable=True``.
+            UnsupportedStorageError: If either index is not backed by the
+                default dict storage.
+            ValueError: If the construction configurations or sketch
+                coordinate systems differ, `overlap` is not one of the
+                supported strings, or an overlapping key conflicts under
+                ``"identical"``.
+
+        """
+        if not isinstance(other, MinHashLSHEnsemble):
+            raise TypeError("Can only merge with another MinHashLSHEnsemble, got %s" % type(other).__name__)
+        # ``getattr`` with a False default keeps indexes unpickled from a build
+        # that predates mergeable storage working as non-mergeable.
+        if not getattr(self, "_mergeable", False) or not getattr(other, "_mergeable", False):
+            raise MergeNotSupportedError(
+                "Merging requires indexes built with mergeable=True; "
+                "an index built without it cannot retain the per-key data a re-partition needs"
+            )
+        if overlap not in ("error", "identical"):
+            raise ValueError("overlap must be 'error' or 'identical', got %r" % (overlap,))
+        # Check the storage backend before touching any content. Both indexes
+        # are only read below, but the result must be dict-backed too.
+        for index in (self, other):
+            storage_type = getattr(index, "_storage_type", None)
+            if storage_type != "dict":
+                raise UnsupportedStorageError("Merging requires the default dict storage, got %r" % (storage_type,))
+        self._check_merge_compatible(other)
+
+        merged = dict(self._entries)
+        for entry_id, entry in other._entries.items():
+            existing = merged.get(entry_id)
+            if existing is None:
+                merged[entry_id] = entry
+                continue
+            if overlap == "error":
+                raise ValueError("The keys are overlapping, duplicate key exists: %r" % (entry.key,))
+            if existing.size != entry.size or existing.hashvalues != entry.hashvalues:
+                raise ValueError(
+                    "Overlapping key %r has different sizes or hash values in the two indexes" % (entry.key,)
+                )
+            # Accepted identical overlap: keep one copy, so the histogram
+            # counts this key once.
+
+        result = MinHashLSHEnsemble(
+            threshold=self.threshold,
+            num_perm=self.h,
+            num_part=self._num_part,
+            m=self.m,
+            weights=self._weights,
+            storage_config={"type": "dict"},
+            prepickle=self._prepickle,
+            mergeable=True,
+        )
+        prepared = [(entry.key, entry.hashvalues, entry.size) for entry in merged.values()]
+        if prepared:
+            seed = self._seed if self._seed is not None else other._seed
+            permutations = self._permutations if self._permutations is not None else other._permutations
+            result._build(prepared, seed, permutations)
+        return result
+
+    def _check_merge_compatible(self, other: "MinHashLSHEnsemble") -> None:
+        """Validate that two mergeable indexes share build configuration.
+
+        This never reads bucket storage; it only compares configuration held
+        on the objects, so it works for empty shards too.
+        """
+        problems = []
+        if self.threshold != other.threshold:
+            problems.append("threshold (%r != %r)" % (self.threshold, other.threshold))
+        if self.h != other.h:
+            problems.append("num_perm (%r != %r)" % (self.h, other.h))
+        if self._num_part != other._num_part:
+            problems.append("num_part (%r != %r)" % (self._num_part, other._num_part))
+        if self.m != other.m:
+            problems.append("m (%r != %r)" % (self.m, other.m))
+        if self._weights != other._weights:
+            problems.append("weights (%r != %r)" % (self._weights, other._weights))
+        if self._prepickle != other._prepickle:
+            problems.append("prepickle/key encoding (%r != %r)" % (self._prepickle, other._prepickle))
+        if problems:
+            raise ValueError(
+                "Cannot merge MinHashLSHEnsemble indexes with different configuration: " + ", ".join(problems)
+            )
+        if self._seed is not None and other._seed is not None:
+            if self._seed != other._seed:
+                raise ValueError(
+                    "Cannot merge indexes whose sketches used different seeds (%r != %r)"
+                    % (self._seed, other._seed)
+                )
+            if self._permutations != other._permutations:
+                raise ValueError("Cannot merge indexes whose sketches used different permutation parameters")
 
     def query(self, minhash: MinHash, size: int) -> Generator[Hashable, None, None]:
         """Giving the MinHash and size of the query set, retrieve

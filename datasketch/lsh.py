@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import pickle
 import struct
 from collections.abc import Hashable
@@ -9,6 +10,7 @@ from scipy.integrate import quad as integrate
 
 from datasketch.minhash import MinHash
 from datasketch.storage import (
+    DictListStorage,
     OrderedStorage,
     UnorderedStorage,
     UnsupportedStorageError,
@@ -18,6 +20,16 @@ from datasketch.storage import (
     unordered_storage,
 )
 from datasketch.weighted_minhash import WeightedMinHash
+
+
+# Sentinel used by ``MinHashLSH.merge`` to tell "the caller did not use the
+# new overlap option" apart from "the caller explicitly asked for a policy".
+class _OverlapUnset:
+    def __repr__(self) -> str:
+        return "<unset>"
+
+
+_OVERLAP_UNSET = _OverlapUnset()
 
 
 def _false_positive_probability(threshold, b, r):
@@ -232,7 +244,13 @@ class MinHashLSH:
         """
         self._insert(key, minhash, check_duplication=check_duplication, buffer=False)
 
-    def merge(self, other: MinHashLSH, check_overlap: bool = False):
+    def merge(
+        self,
+        other: MinHashLSH,
+        check_overlap: bool = False,
+        *,
+        overlap: Optional[str] = _OVERLAP_UNSET,
+    ):
         """Merge the other MinHashLSH with this one, making this one the union
         of both.
 
@@ -244,13 +262,37 @@ class MinHashLSH:
             other (MinHashLSH): The other MinHashLSH.
             check_overlap (bool): Check if there are any overlapping keys before merging and raise if there are any.
                 (`default=False`)
+            overlap (Optional[str]): The policy for keys present in both
+                indexes. When not passed, the legacy behaviour is kept. Pass
+                ``"error"`` to raise as soon as any key overlaps, or
+                ``"identical"`` to accept an overlapping key only once,
+                provided every band signature stored for that key in this
+                index equals the one stored in `other`; otherwise a
+                :class:`ValueError` is raised. The comparison uses the
+                signatures actually stored in each index, for all of that
+                index's bands, so a key whose stored signature was changed in
+                either index is rejected. This option cannot be combined with
+                `check_overlap=True`.
 
         Raises:
             ValueError: If the two MinHashLSH have different initialization
-                parameters, or if `check_overlap` is `True` and there are overlapping keys.
+                parameters, if `check_overlap` is `True` and there are
+                overlapping keys, if an explicit `overlap` policy is combined
+                with `check_overlap=True`, or if the `"identical"` policy finds
+                an overlapping key with differing stored signatures.
+            UnsupportedStorageError: If an `overlap` policy is requested for a
+                bucket backend other than the default dict storage. The check
+                happens before this index is modified.
 
         """
-        self._merge(other, check_overlap=check_overlap, buffer=False)
+        if overlap is _OVERLAP_UNSET:
+            self._merge(other, check_overlap=check_overlap, buffer=False)
+            return
+        if overlap not in ("error", "identical"):
+            raise ValueError("overlap must be 'error' or 'identical', got %r" % (overlap,))
+        if check_overlap:
+            raise ValueError("check_overlap=True cannot be combined with the overlap option")
+        self._merge(other, check_overlap=False, buffer=False, overlap=overlap)
 
     def insertion_session(self, buffer_size: int = 50000) -> MinHashLSHInsertionSession:
         """Create a context manager for fast insertion into this index.
@@ -355,19 +397,102 @@ class MinHashLSH:
         """
         return type(self) is type(other) and self.h == other.h and self.b == other.b and self.r == other.r
 
-    def _merge(self, other: MinHashLSH, check_overlap: bool = False, buffer: bool = False) -> None:
-        if self.__equivalent(other):
-            if check_overlap and set(self.keys).intersection(set(other.keys)):
-                raise ValueError("The keys are overlapping, duplicate key exists.")
-            for key in other.keys:
-                Hs = other.keys.get(key)
-                self.keys.insert(key, *Hs, buffer=buffer)
-                for H, hashtable in zip(Hs, self.hashtables):
-                    hashtable.insert(H, key, buffer=buffer)
-        else:
+    def _merge(
+        self,
+        other: MinHashLSH,
+        check_overlap: bool = False,
+        buffer: bool = False,
+        overlap=_OVERLAP_UNSET,
+    ) -> None:
+        if overlap is _OVERLAP_UNSET:
+            # Legacy path: kept byte-for-byte compatible.
+            if self.__equivalent(other):
+                if check_overlap and set(self.keys).intersection(set(other.keys)):
+                    raise ValueError("The keys are overlapping, duplicate key exists.")
+                for key in other.keys:
+                    Hs = other.keys.get(key)
+                    self.keys.insert(key, *Hs, buffer=buffer)
+                    for H, hashtable in zip(Hs, self.hashtables):
+                        hashtable.insert(H, key, buffer=buffer)
+            else:
+                if type(self) is not type(other):
+                    raise ValueError(f"Cannot merge type MinHashLSH and type {type(other).__name__}.")
+                raise ValueError("Cannot merge MinHashLSH with different initialization parameters.")
+            return
+
+        if overlap not in ("error", "identical"):
+            raise ValueError("overlap must be 'error' or 'identical', got %r" % (overlap,))
+        if buffer:
+            raise ValueError("An explicit overlap policy cannot be used with buffered merging")
+        if not self.__equivalent(other):
             if type(self) is not type(other):
                 raise ValueError(f"Cannot merge type MinHashLSH and type {type(other).__name__}.")
             raise ValueError("Cannot merge MinHashLSH with different initialization parameters.")
+        # The in-place rollback below relies on the two dict-backed containers.
+        for lsh in (self, other):
+            storages = [lsh.keys, *lsh.hashtables]
+            if not all(isinstance(storage, DictListStorage) for storage in storages):
+                raise UnsupportedStorageError(
+                    "Overlap-aware merging requires the default dict storage for both indexes, got %s"
+                    % type(lsh.keys).__name__
+                )
+
+        # Plan every write before touching this index, so a conflict at the
+        # end of one index cannot leave earlier non-conflicting keys behind.
+        plan = []
+        planned_ids = set()
+        for key in list(other.keys):
+            Hs = list(other.keys.get(key))
+            if key in self.keys:
+                if overlap == "error":
+                    raise ValueError("The keys are overlapping, duplicate key exists.")
+                # "identical": accept a key already present once only if every
+                # stored band signature matches. Comparing the whole stored
+                # signature list, not a prefix, catches a changed late band.
+                existing = list(self.keys.get(key))
+                if existing != Hs:
+                    raise ValueError(
+                        "Cannot merge keys with identical identifiers but different stored signatures: %r" % (key,)
+                    )
+                # Accepted identical overlap: the key is already present once,
+                # so no bucket or key-map write is needed.
+                continue
+            if key in planned_ids:
+                # The other index itself stores this key more than once. Both
+                # copies are identical by construction (same key => same
+                # buckets), so a second record would only duplicate it.
+                continue
+            planned_ids.add(key)
+            plan.append((key, Hs))
+
+        if not plan:
+            return
+
+        # Apply, recording enough to undo a partial write. Each write is
+        # recorded *before* it happens, because a failing backend write may
+        # itself leave a partial value behind.
+        added_keys = []
+        added_buckets = []
+        try:
+            for key, Hs in plan:
+                for H, hashtable in zip(Hs, self.hashtables):
+                    if key not in hashtable.get(H):
+                        added_buckets.append((hashtable, H, key))
+                        hashtable.insert(H, key)
+                # Recorded before the write so a partial key-map write is also
+                # removed on rollback; the key was proven absent above.
+                added_keys.append(key)
+                self.keys.insert(key, *Hs)
+        except BaseException:
+            for hashtable, H, key in reversed(added_buckets):
+                with contextlib.suppress(KeyError, ValueError):
+                    hashtable.remove_val(H, key)
+                if not hashtable.get(H) and hashtable.has_key(H):
+                    hashtable.remove(H)
+            for key in reversed(added_keys):
+                if key in self.keys:
+                    self.keys.remove(key)
+            raise
 
     def query(self, minhash) -> list[Hashable]:
         """Giving the MinHash of the query set, retrieve

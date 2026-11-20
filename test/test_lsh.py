@@ -589,5 +589,204 @@ class TestWeightedMinHashLSH(unittest.TestCase):
         self.assertTrue("b" in result)
 
 
+class TestMergeOverlapPolicy(unittest.TestCase):
+    """The ``overlap=`` policy on :meth:`MinHashLSH.merge`."""
+
+    def _lsh(self, params=(4, 4), num_perm=16, **kwargs):
+        return MinHashLSH(num_perm=num_perm, params=params, **kwargs)
+
+    @staticmethod
+    def _minhash(bytes_value, num_perm=16):
+        m = MinHash(num_perm)
+        m.update(bytes_value)
+        return m
+
+    def _snapshot(self, lsh):
+        tables = tuple(tuple(sorted((H, tuple(sorted(keys))) for H, keys in t._dict.items())) for t in lsh.hashtables)
+        keys = tuple(sorted((key, tuple(Hs)) for key, Hs in lsh.keys._dict.items()))
+        return tables, keys
+
+    def test_legacy_semantics_when_overlap_not_passed(self):
+        left, right = self._lsh(), self._lsh()
+        m = self._minhash(b"a")
+        left.insert("a", m)
+        right.insert("a", m)
+        # No check_overlap: the duplicate is simply added again.
+        left.merge(right)
+        self.assertIn("a", left)
+        left.merge(right, check_overlap=False)
+        self.assertIn("a", left)
+
+    def test_overlap_error_on_any_intersection(self):
+        left, right = self._lsh(), self._lsh()
+        m, n = self._minhash(b"a"), self._minhash(b"b")
+        left.insert("a", m)
+        left.insert("b", n)
+        right.insert("b", n)
+        right.insert("c", self._minhash(b"c"))
+        before = self._snapshot(left)
+        with self.assertRaises(ValueError):
+            left.merge(right, overlap="error")
+        self.assertEqual(self._snapshot(left), before)
+
+    def test_overlap_identical_accepts_equal_signatures_once(self):
+        left, right = self._lsh(), self._lsh()
+        m = self._minhash(b"a")
+        left.insert("a", m)
+        right.insert("a", m)
+        right.insert("b", self._minhash(b"b"))
+        left.merge(right, overlap="identical")
+        self.assertIn("a", left)
+        self.assertIn("b", left)
+        # Every band bucket holds "a" exactly once.
+        for band, table in enumerate(left.hashtables):
+            H = left._H(m.hashvalues[band * left.r : (band + 1) * left.r])
+            self.assertEqual(list(table[H]).count("a"), 1)
+
+    def test_overlap_identical_rejects_any_differing_band(self):
+        left, right = self._lsh(params=(4, 4)), self._lsh(params=(4, 4))
+        left.insert("a", self._minhash(b"a"))
+        other = self._minhash(b"a")
+        # Change only the last band's hash values.
+        other.hashvalues[-4:] = np.uint64(12345)
+        right.insert("a", other)
+        right.insert("b", self._minhash(b"b"))
+        before = self._snapshot(left)
+        with self.assertRaises(ValueError):
+            left.merge(right, overlap="identical")
+        self.assertEqual(self._snapshot(left), before)
+        # The receiver is not left with the non-conflicting key either.
+        self.assertNotIn("b", left)
+
+    def test_overlap_identical_rejects_earlier_band_change(self):
+        left, right = self._lsh(params=(4, 4)), self._lsh(params=(4, 4))
+        left.insert("a", self._minhash(b"a"))
+        other = self._minhash(b"a")
+        other.hashvalues[:4] = np.uint64(999)
+        right.insert("a", other)
+        with self.assertRaises(ValueError):
+            left.merge(right, overlap="identical")
+
+    def test_conflict_after_nonconflicting_keys_leaves_none(self):
+        left, right = self._lsh(params=(4, 4)), self._lsh(params=(4, 4))
+        left.insert("a", self._minhash(b"a"))
+        # Insert the conflicting key last in the other index.
+        right.insert("b", self._minhash(b"b"))
+        right.insert("c", self._minhash(b"c"))
+        conflicting = self._minhash(b"a")
+        conflicting.hashvalues[-1] = np.uint64(7)
+        right.insert("a", conflicting)
+        before = self._snapshot(left)
+        with self.assertRaises(ValueError):
+            left.merge(right, overlap="identical")
+        self.assertEqual(self._snapshot(left), before)
+        self.assertNotIn("b", left)
+        self.assertNotIn("c", left)
+
+    def test_check_overlap_cannot_be_mixed_with_overlap(self):
+        left, right = self._lsh(), self._lsh()
+        left.insert("a", self._minhash(b"a"))
+        for policy in ("error", "identical"):
+            with self.assertRaises(ValueError):
+                left.merge(right, check_overlap=True, overlap=policy)
+        with self.assertRaises(ValueError):
+            left.merge(right, overlap="unknown")
+
+    def test_storage_isolation(self):
+        left, right = self._lsh(), self._lsh()
+        m = self._minhash(b"a")
+        left.insert("a", m)
+        right.insert("b", self._minhash(b"b"))
+        right.insert("c", self._minhash(b"c"))
+        right_before = self._snapshot(right)
+        left.merge(right, overlap="identical")
+        self.assertEqual(self._snapshot(right), right_before)
+        # Removing a merged key from the receiver does not affect the source.
+        left.remove("b")
+        self.assertIn("b", right)
+        self.assertNotIn("b", left)
+        # And removing from the source does not affect the receiver.
+        right.remove("c")
+        self.assertIn("c", left)
+        self.assertNotIn("c", right)
+
+    def test_unsupported_storage_rejected_before_modification(self):
+        with patch("redis.Redis", fake_redis):
+            storage_config = {"type": "redis", "redis": {"host": "localhost", "port": 6379}}
+            left = MinHashLSH(num_perm=16, params=(4, 4), storage_config=storage_config)
+            right = MinHashLSH(num_perm=16, params=(4, 4), storage_config=storage_config)
+            left.insert("a", self._minhash(b"a"))
+            with self.assertRaises(UnsupportedStorageError):
+                left.merge(right, overlap="identical")
+            self.assertIn("a", left)
+            self.assertNotIn("b", left)
+
+    def test_injected_write_failure_rolls_back(self):
+        left, right = self._lsh(params=(8, 2)), self._lsh(params=(8, 2))
+        left.insert("a", self._minhash(b"a"))
+        for i in range(5):
+            right.insert("b%d" % i, self._minhash(("b%d" % i).encode()))
+        before = self._snapshot(left)
+
+        table = left.hashtables[3]
+        original_insert = table.insert
+        calls = {"n": 0}
+
+        def failing_insert(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 4:
+                raise MemoryError("injected")
+            return original_insert(*args, **kwargs)
+
+        with patch.object(table, "insert", failing_insert), self.assertRaises(MemoryError):
+            left.merge(right, overlap="identical")
+        self.assertEqual(calls["n"], 4)
+        self.assertEqual(self._snapshot(left), before)
+        # The source is unchanged as well.
+        self.assertEqual(sorted(right.keys.keys()), sorted(right.keys.keys()))
+        self.assertEqual(len(list(right.keys)), 5)
+
+    def test_injected_keymap_partial_write_rolls_back(self):
+        # Fail inside the key-map write itself, after some bucket writes have
+        # landed, to check the receiver is restored from a partial key record.
+        left, right = self._lsh(params=(8, 2)), self._lsh(params=(8, 2))
+        left.insert("a", self._minhash(b"a"))
+        for i in range(4):
+            right.insert("b%d" % i, self._minhash(("b%d" % i).encode()))
+        before = self._snapshot(left)
+        keys_storage = left.keys
+        original_insert = keys_storage.insert
+        calls = {"n": 0}
+
+        def failing_insert(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:
+                # Simulate a backend write that lands partially: append the
+                # value, then raise.
+                original_insert(*args, **kwargs)
+                raise MemoryError("injected in key map")
+            return original_insert(*args, **kwargs)
+
+        with patch.object(keys_storage, "insert", failing_insert), self.assertRaises(MemoryError):
+            left.merge(right, overlap="identical")
+        self.assertEqual(calls["n"], 3)
+        self.assertEqual(self._snapshot(left), before)
+        self.assertEqual(len(list(right.keys)), 4)
+
+    def test_merge_with_identical_overlap_equals_plain_union(self):
+        left, right = self._lsh(params=(4, 4)), self._lsh(params=(4, 4))
+        left_entries = {"a": self._minhash(b"a"), "b": self._minhash(b"b")}
+        right_entries = {"b": left_entries["b"], "c": self._minhash(b"c")}
+        for key, m in left_entries.items():
+            left.insert(key, m)
+        for key, m in right_entries.items():
+            right.insert(key, m)
+        left.merge(right, overlap="identical")
+        plain = self._lsh(params=(4, 4))
+        for key, m in {"a": left_entries["a"], "b": left_entries["b"], "c": right_entries["c"]}.items():
+            plain.insert(key, m)
+        self.assertEqual(self._snapshot(left), self._snapshot(plain))
+
+
 if __name__ == "__main__":
     unittest.main()

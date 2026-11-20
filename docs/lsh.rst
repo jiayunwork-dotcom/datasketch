@@ -85,6 +85,38 @@ makes MinHashLSH useful in parallel processing.
     # This merges the lsh1 with lsh2.
     lsh1.merge(lsh2)
 
+The merged index is modified in place. Two indexes can only be merged when
+their ``num_perm``, number of bands and band size match. By default an
+overlapping key is simply added again, which is the historical behaviour and
+is controlled by ``check_overlap``:
+
+.. code:: python
+
+    # Raise if any key appears in both indexes.
+    lsh1.merge(lsh2, check_overlap=True)
+
+For unioning shards that may share keys, pass ``overlap=`` instead. This
+option cannot be combined with ``check_overlap=True``:
+
+.. code:: python
+
+    # Raise on any overlapping key, before anything is written.
+    lsh1.merge(lsh2, overlap="error")
+
+    # Accept an overlapping key once, only if all of its stored band
+    # signatures are identical in both indexes; raise otherwise.
+    lsh1.merge(lsh2, overlap="identical")
+
+The ``"identical"`` policy compares the signatures actually stored in each
+index, for every band of that index. A key whose stored signature was changed
+in either index is therefore rejected, and an accepted key is stored only
+once. The write is rolled back if any bucket or key-map write fails, so a
+conflict found late does not leave the earlier non-conflicting keys in the
+receiver. Overlap-aware merging is only supported by the default in-process
+``dict`` storage; other backends raise
+:class:`datasketch.storage.UnsupportedStorageError` before the receiver is
+modified.
+
 There are other optional parameters that can be used to tune the index.
 See the documentation of :class:`datasketch.MinHashLSH` for details.
 
