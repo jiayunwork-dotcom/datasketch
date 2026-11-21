@@ -125,6 +125,12 @@ class Storage(ABC):
     #: copying the whole bucket first. Paged LSH queries require this.
     paged_scan_supported = False
 
+    #: Whether buffered value removals are followed by an automatic cleanup
+    #: of emptied keys when the write buffer executes. Backends with this
+    #: capability confirm their key directory themselves at flush time, so
+    #: callers must not probe and prune emptied keys per operation.
+    deferred_bucket_cleanup = False
+
     def __getitem__(self, key):
         return self.get(key)
 
@@ -194,6 +200,13 @@ class Storage(ABC):
     @buffer_size.setter
     def buffer_size(self, value: int):
         self._buffer_size = value
+        # If the storage owns a write buffer (e.g. the Redis buffer), the
+        # capacity applies to the buffer as well, otherwise the buffer
+        # would keep its default capacity and the setting would have no
+        # effect on when buffered commands are flushed.
+        buffer = getattr(self, "_buffer", None)
+        if buffer is not None and hasattr(buffer, "buffer_size"):
+            buffer.buffer_size = value
 
     def status(self):
         return {"keyspace_size": len(self)}
@@ -874,10 +887,30 @@ if redis is not None:
         The only difference from the conventional pipeline object is the
         ``_buffer_size``. Once the buffer is longer than the buffer size,
         the pipeline is automatically executed, and the buffer cleared.
+
+        Args:
+            on_execute: Optional callable invoked after every execution of
+                the buffered commands, whether the execution was triggered
+                automatically by the buffer capacity or explicitly, and
+                whether it succeeded or failed. Storage containers use the
+                hook to reconcile bookkeeping about queued-but-not-yet-
+                executed commands: once the pipeline executes, its command
+                stack is either applied or discarded, so bookkeeping must
+                be reconciled at exactly this point and not earlier.
+
         """
 
-        def __init__(self, connection_pool, response_callbacks, transaction, buffer_size, shard_hint=None):
+        def __init__(
+            self,
+            connection_pool,
+            response_callbacks,
+            transaction,
+            buffer_size,
+            shard_hint=None,
+            on_execute=None,
+        ):
             self._buffer_size = buffer_size
+            self._on_execute = on_execute
             super(RedisBuffer, self).__init__(connection_pool, response_callbacks, transaction, shard_hint=shard_hint)
 
         @property
@@ -887,6 +920,25 @@ if redis is not None:
         @buffer_size.setter
         def buffer_size(self, value):
             self._buffer_size = value
+
+        def execute(self, *args, **kwargs):
+            try:
+                return super(RedisBuffer, self).execute(*args, **kwargs)
+            except Exception:
+                # redis-py discards the command stack when an execution
+                # fails after the connection was established, but keeps it
+                # when establishing the connection itself fails. Make the
+                # behaviour uniform: a failed flush discards the buffered
+                # commands instead of replaying them silently on a later
+                # flush.
+                self.reset()
+                raise
+            finally:
+                # The command stack is discarded whether the execution
+                # succeeded or not, so the reconciliation hook must run in
+                # either case.
+                if self._on_execute is not None:
+                    self._on_execute()
 
         def execute_command(self, *args, **kwargs):
             if len(self.command_stack) >= self._buffer_size:
@@ -935,19 +987,20 @@ if redis is not None:
                 self._redis.response_callbacks,
                 transaction=redis_buffer_param.get("transaction", True),
                 buffer_size=self._buffer_size,
+                on_execute=self._on_buffer_execute,
             )
             if name is None:
                 name = _random_name(11)
             self._name = name
 
-        @property
-        def buffer_size(self):
-            return self._buffer_size
+        def _on_buffer_execute(self):
+            """Reconcile bookkeeping after the write buffer executed.
 
-        @buffer_size.setter
-        def buffer_size(self, value):
-            self._buffer_size = value
-            self._buffer.buffer_size = value
+            This hook runs after every execution of the buffered commands
+            (automatic or explicit, successful or not). The base
+            implementation does nothing; subclasses override it to clear or
+            confirm their records of queued-but-not-yet-executed operations.
+            """
 
         def redis_key(self, key):
             if isinstance(key, str):
@@ -984,6 +1037,15 @@ if redis is not None:
     class RedisListStorage(OrderedStorage, RedisStorage):
         def __init__(self, config, name=None):
             RedisStorage.__init__(self, config, name=name)
+            # Keys whose insert/remove commands are queued in the write
+            # buffer but not executed yet. They let existence checks (e.g.
+            # the duplicate-key check of buffered insertion sessions and the
+            # missing-key check of buffered deletion sessions) see operations
+            # accepted earlier in the same session. Each set is bounded by
+            # the buffer capacity and is cleared every time the buffer
+            # executes, so the bookkeeping grows only with unflushed work.
+            self._pending_inserts = set()
+            self._pending_removes = set()
 
         def keys(self):
             return self._redis.hkeys(self._name)
@@ -1014,8 +1076,14 @@ if redis is not None:
             buffer = kwargs.pop("buffer", False)
             if buffer:
                 self._remove(self._buffer, *keys)
+                # Record only after queueing: queueing may trigger an
+                # automatic flush, which reconciles the pending records.
+                self._note_buffered_remove(*keys)
             else:
                 self._remove(self._redis, *keys)
+
+        def _note_buffered_remove(self, *keys):
+            self._pending_removes.update(keys)
 
         def _remove(self, r, *keys):
             r.hdel(self._name, *keys)
@@ -1025,11 +1093,11 @@ if redis is not None:
             buffer = kwargs.pop("buffer", False)
             redis_key = self.redis_key(key)
             if buffer:
-                self._buffer.lrem(redis_key, val)
+                self._buffer.lrem(redis_key, 0, val)
             else:
-                self._redis.lrem(redis_key, val)
+                self._redis.lrem(redis_key, 0, val)
                 if not self._redis.exists(redis_key):
-                    self._redis.hdel(self._name, redis_key)
+                    self._redis.hdel(self._name, key)
 
         def insert(self, key, *vals, **kwargs):
             # Using buffer=True outside of an `insertion_session`
@@ -1039,8 +1107,14 @@ if redis is not None:
             buffer = kwargs.pop("buffer", False)
             if buffer:
                 self._insert(self._buffer, key, *vals)
+                # Record only after queueing: queueing may trigger an
+                # automatic flush, which reconciles the pending records.
+                self._note_buffered_insert(key)
             else:
                 self._insert(self._redis, key, *vals)
+
+        def _note_buffered_insert(self, key):
+            self._pending_inserts.add(key)
 
         def _insert(self, r, key, *values):
             redis_key = self.redis_key(key)
@@ -1063,31 +1137,86 @@ if redis is not None:
             return r.llen(k)
 
         def has_key(self, key):
+            if key in self._pending_removes:
+                return False
+            if key in self._pending_inserts:
+                return True
             return self._redis.hexists(self._name, key)
 
+        def _on_buffer_execute(self):
+            self._pending_inserts = set()
+            self._pending_removes = set()
+
         def empty_buffer(self):
+            command_stack = getattr(self._buffer, "command_stack", None)
+            if command_stack is not None and not command_stack:
+                # Nothing buffered: skip the execution and the reconnection.
+                return
             self._buffer.execute()
             # To avoid broken pipes, recreate the connection
             # objects upon emptying the buffer
             self.__init__(self.config, name=self._name)
 
     class RedisSetStorage(UnorderedStorage, RedisListStorage):
+        deferred_bucket_cleanup = True
+
         def __init__(self, config, name=None):
             RedisListStorage.__init__(self, config, name=name)
+            # Bucket keys whose members have queued-but-not-yet-executed SREM
+            # commands. When the buffer executes, buckets that ended up empty
+            # are dropped from the bucket directory, so no zero-member
+            # entries are left behind. Bounded by the buffer capacity.
+            self._pending_srem_buckets = set()
 
         @staticmethod
         def _get_items(r, k):
             return r.smembers(k)
+
+        def _note_buffered_insert(self, key):
+            # Bucket inserts must not leak into existence checks: query
+            # visibility of buffered writes stays as it was.
+            pass
+
+        def _note_buffered_remove(self, *keys):
+            # Same as above: bucket removals are confirmed against the
+            # storage itself when the buffer executes.
+            pass
 
         def remove_val(self, key, val, **kwargs):
             buffer = kwargs.pop("buffer", False)
             redis_key = self.redis_key(key)
             if buffer:
                 self._buffer.srem(redis_key, val)
+                # Record only after queueing: queueing may trigger an
+                # automatic flush, which reconciles the pending records.
+                self._pending_srem_buckets.add(key)
             else:
                 self._redis.srem(redis_key, val)
                 if not self._redis.exists(redis_key):
-                    self._redis.hdel(self._name, redis_key)
+                    self._redis.hdel(self._name, key)
+
+        def _on_buffer_execute(self):
+            RedisListStorage._on_buffer_execute(self)
+            self._confirm_empty_buckets()
+
+        def _confirm_empty_buckets(self):
+            """Drop buckets whose last member was removed by flushed commands.
+
+            The bucket directory (the hash named by ``self._name``) must not
+            keep entries whose bucket has no members left; buckets that still
+            hold other members are kept untouched.
+            """
+            touched = self._pending_srem_buckets
+            if not touched:
+                return
+            self._pending_srem_buckets = set()
+            pipe = self._redis.pipeline()
+            for bucket in touched:
+                pipe.scard(self.redis_key(bucket))
+            counts = pipe.execute()
+            empty = [bucket for bucket, count in zip(touched, counts) if count == 0]
+            if empty:
+                self._redis.hdel(self._name, *empty)
 
         def _insert(self, r, key, *values):
             redis_key = self.redis_key(key)

@@ -255,37 +255,46 @@ class MinHashLSH:
     def insertion_session(self, buffer_size: int = 50000) -> MinHashLSHInsertionSession:
         """Create a context manager for fast insertion into this index.
 
+        Insertions made through the session are buffered and flushed to the
+        storage automatically when a storage buffer fills up, and once more
+        when the session is closed (explicitly or by exiting the ``with``
+        block). With the default `check_duplication=True`, keys that are
+        already stored - or that were accepted earlier in the same session -
+        are rejected with a :class:`ValueError`, regardless of whether their
+        commands have been flushed yet. A closed session rejects further
+        operations.
+
         Args:
-        e         buffer_size (int): The buffer size for insert_session mode (default=50000).
+            buffer_size (int): The buffer size for insert_session mode (default=50000).
 
         Returns:
-                 MinHashLSHInsertionSession: The context manager.
+            MinHashLSHInsertionSession: The context manager.
 
         Example:
-                 Insert 100 MinHashes into an Redis-backed index using a session:
+            Insert 100 MinHashes into an Redis-backed index using a session:
 
-                 .. code-block:: python
+            .. code-block:: python
 
-                     from datasketch import MinHash, MinHashLSH
-                     import numpy as np
+                from datasketch import MinHash, MinHashLSH
+                import numpy as np
 
-                     minhashes = []
-                     for i in range(100):
-                         m = MinHash(num_perm=128)
-                         m.update_batch(np.random.randint(low=0, high=30, size=10))
-                         minhashes.append(m)
+                minhashes = []
+                for i in range(100):
+                    m = MinHash(num_perm=128)
+                    m.update_batch(np.random.randint(low=0, high=30, size=10))
+                    minhashes.append(m)
 
-                     lsh = MinHashLSH(
-                         threshold=0.5,
-                         num_perm=128,
-                         storage_config={
-                             "type": "redis",
-                             "redis": {"host": "localhost", "port": 6379},
-                         },
-                     )
-                     with lsh.insertion_session() as session:
-                         for i, m in enumerate(minhashes):
-                             session.insert(i, m)
+                lsh = MinHashLSH(
+                    threshold=0.5,
+                    num_perm=128,
+                    storage_config={
+                        "type": "redis",
+                        "redis": {"host": "localhost", "port": 6379},
+                    },
+                )
+                with lsh.insertion_session() as session:
+                    for i, m in enumerate(minhashes):
+                        session.insert(i, m)
 
         """
         return MinHashLSHInsertionSession(self, buffer_size=buffer_size)
@@ -293,34 +302,44 @@ class MinHashLSH:
     def deletion_session(self, buffer_size: int = 50000) -> MinHashLSHDeletionSession:
         """Create a context manager for fast deletion from this index.
 
+        Removals made through the session are buffered and flushed to the
+        storage automatically when a storage buffer fills up, and once more
+        when the session is closed (explicitly or by exiting the ``with``
+        block). Keys are considered present according to the order of the
+        calls: removing a key that is not stored - or that was already
+        removed earlier in the same session - raises a :class:`ValueError`.
+        Buckets whose last member is removed are dropped from the bucket
+        directory when the buffered commands are flushed. A closed session
+        rejects further operations.
+
         Args:
-                buffer_size (int): The buffer size for deletion operations (default=50000).
+            buffer_size (int): The buffer size for deletion operations (default=50000).
 
         Returns:
-                MinHashLSHDeletionSession: The context manager.
+            MinHashLSHDeletionSession: The context manager.
 
-        r    Example:
-                Delete keys from a Redis-backed index using a session:
+        Example:
+            Delete keys from a Redis-backed index using a session:
 
-                .. code-block:: python
+            .. code-block:: python
 
-                    from datasketch import MinHashLSH
+                from datasketch import MinHashLSH
 
-                    lsh = MinHashLSH(
-                        threshold=0.5,
-                        num_perm=128,
-                        storage_config={
-                            "type": "redis",
-                            "redis": {"host": "localhost", "port": 6379},
-                        },
-                    )
+                lsh = MinHashLSH(
+                    threshold=0.5,
+                    num_perm=128,
+                    storage_config={
+                        "type": "redis",
+                        "redis": {"host": "localhost", "port": 6379},
+                    },
+                )
 
-                    # ... insert some data ...
+                # ... insert some data ...
 
-                    keys_to_delete = ["key1", "key2", "key3"]
-                    with lsh.deletion_session() as session:
-                        for key in keys_to_delete:
-                            session.remove(key)
+                keys_to_delete = ["key1", "key2", "key3"]
+                with lsh.deletion_session() as session:
+                    for key in keys_to_delete:
+                        session.remove(key)
 
         """
         return MinHashLSHDeletionSession(self, buffer_size=buffer_size)
@@ -517,6 +536,12 @@ class MinHashLSH:
             raise ValueError("The given key does not exist")
         for H, hashtable in zip(self.keys[key], self.hashtables):
             hashtable.remove_val(H, key, buffer=buffer)
+            if buffer and hashtable.deferred_bucket_cleanup:
+                # The storage drops buckets that end up empty when the
+                # buffered commands are executed; probing the bucket here
+                # would read the pre-flush state and cost a round trip per
+                # band per key.
+                continue
             if not hashtable.get(H):
                 hashtable.remove(H, buffer=buffer)
         self.keys.remove(key, buffer=buffer)
@@ -643,7 +668,80 @@ class MinHashLSH:
         return [hashtable.itemcounts() for hashtable in hashtables]
 
 
-class MinHashLSHInsertionSession:
+class _MinHashLSHSession:
+    """Base class for maintenance sessions on a :class:`MinHashLSH`.
+
+    A session buffers write commands of the underlying storages and flushes
+    them either automatically (whenever a storage's buffer reaches its
+    capacity) or when the session is closed. Closing happens explicitly via
+    :meth:`close` or by exiting the ``with`` block. A closed session rejects
+    further operations, and closing a session more than once has no effect.
+
+    Visibility and validation semantics:
+
+    * The existence checks used by maintenance operations - duplicate-key
+      detection on insert and missing-key detection on remove - account for
+      operations accepted earlier in the same session, even when their
+      commands have not been flushed to the storage yet. A rejected
+      operation raises :class:`ValueError` and leaves no partial change
+      behind; the session stays usable for other keys.
+    * Queries and bucket statistics reflect only what has been flushed to
+      the storage, as before; a session does not add read-your-own-writes
+      visibility to :meth:`MinHashLSH.query` or :meth:`MinHashLSH.get_counts`.
+    * If the storage backend fails while flushing at close, the failure is
+      propagated to the caller and the session is still considered closed;
+      commands already executed are not rolled back.
+
+    Args:
+        lsh (MinHashLSH): The MinHashLSH to maintain.
+        buffer_size (int): The buffer size for the session.
+
+    """
+
+    def __init__(self, lsh: MinHashLSH, buffer_size: int):
+        self.lsh = lsh
+        self.lsh.buffer_size = buffer_size
+        self._closed = False
+
+    def __enter__(self):
+        self._check_open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    @property
+    def closed(self) -> bool:
+        """Whether the session has been closed."""
+        return self._closed
+
+    def _check_open(self) -> None:
+        if self._closed:
+            raise ValueError("The session is closed, no further operations are allowed")
+
+    def close(self) -> None:
+        """Flush all buffered operations to the storage and close the session.
+
+        Calling :meth:`close` more than once has no effect. If the backend
+        fails while flushing, every storage still gets its flush attempted,
+        the first failure is re-raised to the caller, and the session is
+        considered closed.
+        """
+        if self._closed:
+            return
+        error = None
+        for storage in (self.lsh.keys, *self.lsh.hashtables):
+            try:
+                storage.empty_buffer()
+            except Exception as exc:  # backend failures must reach the caller
+                if error is None:
+                    error = exc
+        self._closed = True
+        if error is not None:
+            raise error
+
+
+class MinHashLSHInsertionSession(_MinHashLSHSession):
     """Context manager for batch insertion of documents into a MinHashLSH.
 
     Args:
@@ -651,21 +749,6 @@ class MinHashLSHInsertionSession:
         buffer_size (int): The buffer size for insert_session mode.
 
     """
-
-    def __init__(self, lsh: MinHashLSH, buffer_size: int):
-        self.lsh = lsh
-        self.lsh.buffer_size = buffer_size
-
-    def __enter__(self) -> MinHashLSHInsertionSession:
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self.lsh.keys.empty_buffer()
-        for hashtable in self.lsh.hashtables:
-            hashtable.empty_buffer()
 
     def insert(
         self,
@@ -680,12 +763,23 @@ class MinHashLSHInsertionSession:
         Args:
             key (Hashable): The unique identifier of the set.
             minhash (Union[MinHash, WeightedMinhash]): The MinHash of the set.
+            check_duplication (bool): To avoid duplicate keys in the storage
+                (`default=True`). Keys already stored and keys accepted
+                earlier in this session both count as existing, whatever
+                signature they were inserted with.
+
+        Raises:
+            ValueError: If the key already exists (and `check_duplication`
+                is True), if the MinHash has the wrong length, or if the
+                session is closed.
+            TypeError: If the key type is not accepted by the storage.
 
         """
+        self._check_open()
         self.lsh._insert(key, minhash, check_duplication=check_duplication, buffer=True)
 
 
-class MinHashLSHDeletionSession:
+class MinHashLSHDeletionSession(_MinHashLSHSession):
     """Context manager for batch deletion of documents from a MinHashLSH.
 
     Args:
@@ -694,21 +788,6 @@ class MinHashLSHDeletionSession:
 
     """
 
-    def __init__(self, lsh: MinHashLSH, buffer_size: int):
-        self.lsh = lsh
-        self.lsh.buffer_size = buffer_size
-
-    def __enter__(self) -> MinHashLSHDeletionSession:
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        self.close()
-
-    def close(self) -> None:
-        self.lsh.keys.empty_buffer()
-        for hashtable in self.lsh.hashtables:
-            hashtable.empty_buffer()
-
     def remove(self, key: Hashable) -> None:
         """Remove a key from the index.
 
@@ -716,7 +795,10 @@ class MinHashLSHDeletionSession:
             key (Hashable): The unique identifier to remove.
 
         Raises:
-            ValueError: If the key does not exist.
+            ValueError: If the key does not exist, including when it was
+                already removed earlier in this session, or if the session
+                is closed.
 
         """
+        self._check_open()
         self.lsh._remove(key, buffer=True)

@@ -163,6 +163,9 @@ minversion = "6.0"
 addopts = ["--strict-markers", "--color=yes", "--cov-report=xml"]
 testpaths = ["test"]
 asyncio_mode = "auto"
+markers = [
+    "integration: tests that start a local redis-server (skipped when no server binary is available)",
+]
 
 [tool.pyright]
 include = ["datasketch"]

@@ -129,6 +129,43 @@ bulk insertion.
 Note that querying the LSH object during an open insertion session may result in
 inconsistency.
 
+.. _minhash_lsh_maintenance_sessions:
+
+Maintenance sessions
+--------------------
+``insertion_session`` and ``deletion_session`` are context managers for bulk
+maintenance of an index. Operations issued through a session are buffered and
+flushed to the storage automatically whenever a storage buffer reaches its
+capacity (``buffer_size`` commands), and once more when the session is closed
+- either explicitly with ``close()`` or by exiting the ``with`` block. Calling
+``close()`` more than once has no effect, and a closed session rejects further
+operations with a ``ValueError``.
+
+An insertion session accepts ``insert(key, minhash, check_duplication=True)``
+with the same validation as :meth:`MinHashLSH.insert`. With the default
+``check_duplication=True``, a key is rejected with a ``ValueError`` if it is
+already stored *or* was accepted earlier in the same session - no matter which
+signature it carries and no matter whether its commands have been flushed yet.
+A deletion session accepts ``remove(key)`` and decides existence by call
+order: removing a key that is not stored, or that was already removed in the
+same session, raises a ``ValueError``. A rejected operation leaves no partial
+change behind, and the session stays usable for other keys.
+
+Visibility during an open session is unchanged: queries and bucket statistics
+reflect only what has been flushed so far, while membership checks (``key in
+lsh``) and the duplicate/missing-key validation above do account for
+accepted-but-unflushed operations of the current session. After a session is
+closed successfully, the key storage, the per-band buckets, the query results
+and the bucket statistics all agree: every stored key has exactly one complete
+set of band signatures, removed keys no longer match, removing one member of
+a shared bucket keeps the other members, and a bucket whose last member was
+removed leaves no zero-member entry in the bucket statistics.
+
+If the storage backend fails while flushing at close, the failure is
+propagated to the caller and the session is considered closed; commands that
+were already executed are not rolled back, and a failed flush discards the
+buffered commands of that storage rather than replaying them later.
+
 MinHash LSH also supports a Cassandra cluster as a storage layer. Using a long-term
 storage for your LSH addresses all use cases where the application needs to continuously update
 the LSH object (for example when you use MinHash LSH to incrementally cluster documents).
